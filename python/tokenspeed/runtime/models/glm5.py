@@ -1195,9 +1195,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         if ctx.num_extends <= 0 or num_prefill_tokens <= 0:
             return None
 
-        chunk_meta = getattr(ctx.attn_backend, "chunked_prefill_metadata", None)
-        if chunk_meta is None:
-            return None
+        chunk_meta = ctx.attn_backend.chunked_prefill_metadata
         prefix_lens = chunk_meta.extend_prefix_lens[: ctx.num_extends].to(torch.int32)
         extend_lens = chunk_meta.extend_seq_lens[: ctx.num_extends].to(torch.int32)
         seq_lens = prefix_lens + extend_lens
@@ -1216,11 +1214,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         page_size = ctx.token_to_kv_pool.page_size
         max_seq_len = int(seq_lens.max().item())
         max_pages = (max_seq_len + page_size - 1) // page_size
-        block_tables_snapshot = getattr(ctx.attn_backend, "_prefill_block_tables", None)
-        if block_tables_snapshot is None:
-            req_pool_indices = chunk_meta.req_pool_indices[: ctx.num_extends].long()
-            block_tables_snapshot = ctx.req_to_page[req_pool_indices]
-        block_tables = block_tables_snapshot[:, :max_pages].to(
+        block_tables = chunk_meta.block_tables[:, :max_pages].to(
             device=indexer_output.query.device,
             dtype=torch.int32,
         )

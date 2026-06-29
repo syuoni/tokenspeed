@@ -96,6 +96,9 @@ class TRTLLMMLAChunkedPrefillMetadata:
     chunked_seq_len: torch.Tensor  # (chunked_loop_num, num_extends) int32 GPU
     cu_chunked_seq_len: torch.Tensor  # (chunked_loop_num, num_extends+1) int32 GPU
     max_chunk_len_per_loop: list  # List[int], one per loop_idx
+    # Per-request page table (req_to_page[req_pool_indices]). Populated only by
+    # the DSA backend for sparse-prefill top-k; plain MLA leaves it None.
+    block_tables: torch.Tensor | None = None
 
 
 @dataclass

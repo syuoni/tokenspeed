@@ -61,7 +61,6 @@ class DSABackend(AttentionBackend):
         self.data_type = config.kv_cache_dtype
         self.q_data_type = config.dtype
         self.num_local_heads = config.num_attention_heads // config.attn_tp_size
-        self._prefill_block_tables: torch.Tensor | None = None
 
     @property
     def forward_decode_metadata(self):
@@ -242,16 +241,12 @@ class DSABackend(AttentionBackend):
             spec_info=spec_info,
             **kwargs,
         )
-        self._prefill_block_tables = None
-        if (
-            num_extends > 0
-            and req_to_page is not None
-            and forward_mode.is_extend_or_mixed()
-        ):
-            cmeta = getattr(self._dense_backend, "chunked_prefill_metadata", None)
-            if cmeta is not None and cmeta.req_pool_indices is not None:
-                ext_idx = cmeta.req_pool_indices[:num_extends].long()
-                self._prefill_block_tables = req_to_page[ext_idx]
+
+        if forward_mode.is_extend_or_mixed():
+            chunk_meta = self._dense_backend.chunked_prefill_metadata
+            chunk_meta.block_tables = req_to_page[
+                chunk_meta.req_pool_indices[:num_extends]
+            ]
         return out
 
     def _validate_logit_cap(self, logits_soft_cap: float) -> None:
