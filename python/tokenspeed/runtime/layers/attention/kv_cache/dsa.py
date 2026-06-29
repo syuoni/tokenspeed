@@ -26,7 +26,10 @@ from tokenspeed_kernel.ops.attention.triton.dsa_sparse_layout import (
 )
 from tokenspeed_kernel.ops.quantization import quantize_fp8_with_scale
 
-from tokenspeed.runtime.layers.attention.configs.dsa import dsa_sparse_decode_row_bytes
+from tokenspeed.runtime.layers.attention.configs.dsa import (
+    dsa_index_k_row_bytes,
+    dsa_sparse_decode_row_bytes,
+)
 from tokenspeed.runtime.layers.attention.kv_cache.mla import (
     MLATokenToKVPool,
     _get_tensor_size_bytes,
@@ -57,14 +60,10 @@ class DSATokenToKVPool(MLATokenToKVPool):
             kv_lora_rank,
             qk_rope_head_dim,
         )
-        if self.index_head_dim % _INDEX_K_FP8_GROUP_SIZE == 0:
-            self.index_k_with_scale_row_bytes = (
-                self.index_head_dim
-                + self.index_head_dim // _INDEX_K_FP8_GROUP_SIZE * _INDEX_K_SCALE_BYTES
-            )
-        else:
-            self.index_k_with_scale_row_bytes = 0
-        self._index_k_with_scale_available = self.index_k_with_scale_row_bytes > 0
+        self.index_k_row_bytes = dsa_index_k_row_bytes(
+            self.index_head_dim,
+        )
+        self._index_k_available = self.index_k_row_bytes > 0
         super().__init__(*args, **kwargs)
         with self.memory_saver_adapter.region():
             self.sparse_decode_kv_buffer = [
@@ -76,24 +75,16 @@ class DSATokenToKVPool(MLATokenToKVPool):
                 for _ in range(self.layer_num)
             ]
             self.index_k_buffer = [
-                torch.zeros(
-                    (self.size + self.page_size, self.index_head_dim),
-                    dtype=self.model_dtype,
-                    device=self.device,
-                )
-                for _ in range(self.layer_num)
-            ]
-            self.index_k_with_scale_buffer = [
                 (
                     torch.zeros(
                         (
                             self.size + self.page_size,
-                            self.index_k_with_scale_row_bytes,
+                            self.index_k_row_bytes,
                         ),
                         dtype=torch.uint8,
                         device=self.device,
                     )
-                    if self.index_k_with_scale_row_bytes > 0
+                    if self.index_k_row_bytes > 0
                     else None
                 )
                 for _ in range(self.layer_num)
@@ -101,24 +92,19 @@ class DSATokenToKVPool(MLATokenToKVPool):
 
     def _get_page_size_bytes(self):
         sparse_decode_size_bytes = self.sparse_decode_kv_row_bytes
-        index_size_bytes = self.index_head_dim * torch._utils._element_size(
-            self.model_dtype
-        )
-        index_with_scale_size_bytes = self.index_k_with_scale_row_bytes
+        index_size_bytes = self.index_k_row_bytes
         return (
             super()._get_page_size_bytes()
             + self.page_size * self.layer_num * sparse_decode_size_bytes
             + self.page_size * self.layer_num * index_size_bytes
-            + self.page_size * self.layer_num * index_with_scale_size_bytes
         )
 
     def get_kv_size_bytes(self):
         return (
             super().get_kv_size_bytes()
             + _get_tensor_size_bytes(self.sparse_decode_kv_buffer)
-            + _get_tensor_size_bytes(self.index_k_buffer)
             + _get_tensor_size_bytes(
-                [buf for buf in self.index_k_with_scale_buffer if buf is not None]
+                [buf for buf in self.index_k_buffer if buf is not None]
             )
         )
 
@@ -131,13 +117,11 @@ class DSATokenToKVPool(MLATokenToKVPool):
         for buf in self.sparse_decode_kv_buffer:
             buf[tgt_loc_flat] = buf[src_loc_flat]
         for buf in self.index_k_buffer:
-            buf[tgt_loc_flat] = buf[src_loc_flat]
-        for buf in self.index_k_with_scale_buffer:
             if buf is not None:
                 # Packed FP8 index-K is block-split per page, so a single
                 # token's bytes are NOT a contiguous row; move the FP8 values
                 # and FP32 scales through their block-split views instead.
-                fp8_view, scale_view = self._index_k_with_scale_block_views(buf)
+                fp8_view, scale_view = self._index_k_block_views(buf)
                 ps = self.page_size
                 tgt_page = tgt_loc_flat // ps
                 tgt_slot = tgt_loc_flat % ps
@@ -171,19 +155,14 @@ class DSATokenToKVPool(MLATokenToKVPool):
             self.layer_transfer_counter.wait_until(layer_id)
         return self.sparse_decode_kv_buffer[layer_id]
 
+    def has_index_k_buffer(self) -> bool:
+        return self._index_k_available
+
     def get_index_k_buffer(self, layer_id: int) -> torch.Tensor:
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id)
-        return self.index_k_buffer[layer_id]
-
-    def has_index_k_with_scale_buffer(self) -> bool:
-        return self._index_k_with_scale_available
-
-    def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
-        if self.layer_transfer_counter is not None:
-            self.layer_transfer_counter.wait_until(layer_id)
-        buf = self.index_k_with_scale_buffer[layer_id]
-        if buf is None or not self._index_k_with_scale_available:
+        buf = self.index_k_buffer[layer_id]
+        if buf is None or not self._index_k_available:
             raise RuntimeError("GLM DSA FP8 index K cache is unavailable")
         return buf
 
@@ -196,10 +175,9 @@ class DSATokenToKVPool(MLATokenToKVPool):
         if index_k.dtype != self.model_dtype:
             index_k = index_k.to(self.model_dtype)
         index_k = index_k.view(-1, self.index_head_dim)
-        self.index_k_buffer[layer_id][loc] = index_k
-        self._set_index_k_with_scale_buffer(layer_id, loc, index_k)
+        self._set_index_k_buffer(layer_id, loc, index_k)
 
-    def _index_k_with_scale_block_views(
+    def _index_k_block_views(
         self, buf: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Return per-page block-split views into a packed FP8 index-K buffer.
@@ -242,13 +220,13 @@ class DSATokenToKVPool(MLATokenToKVPool):
         )
         return fp8_view, scale_view
 
-    def gather_index_k_with_scale(
+    def gather_index_k(
         self, layer_id: int, slots: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Gather per-token FP8 index-K values and scales from the cache.
 
         The packed FP8 index-K buffer is stored block-split per page (see
-        :meth:`_index_k_with_scale_block_views`), so the non-paged prefill
+        :meth:`_index_k_block_views`), so the non-paged prefill
         scoring kernel (``fp8_mqa_logits``), which consumes contiguous
         ``(k_fp8, k_scale)`` tensors, must gather token rows through the
         block-split views rather than indexing raw rows.
@@ -262,8 +240,8 @@ class DSATokenToKVPool(MLATokenToKVPool):
             ``[num_slots, head_dim]`` (FP8 e4m3) and ``k_scale`` has shape
             ``[num_slots, num_groups]`` (float32).
         """
-        buf = self.get_index_k_with_scale_buffer(layer_id)
-        fp8_view, scale_view = self._index_k_with_scale_block_views(buf)
+        buf = self.get_index_k_buffer(layer_id)
+        fp8_view, scale_view = self._index_k_block_views(buf)
         slots = slots.to(torch.long)
         page = slots // self.page_size
         slot_in_page = slots % self.page_size
@@ -271,15 +249,15 @@ class DSATokenToKVPool(MLATokenToKVPool):
         k_scale = scale_view[page, slot_in_page]
         return k_fp8, k_scale
 
-    def _set_index_k_with_scale_buffer(
+    def _set_index_k_buffer(
         self,
         layer_id: int,
         loc: torch.Tensor,
         index_k: torch.Tensor,
     ) -> None:
-        if not self._index_k_with_scale_available:
+        if not self._index_k_available:
             return
-        buf = self.index_k_with_scale_buffer[layer_id]
+        buf = self.index_k_buffer[layer_id]
         if buf is None:
             raise RuntimeError("DSA FP8 index K cache is unavailable")
         index_k_fp8, index_k_scale = quantize_fp8_with_scale(
@@ -289,7 +267,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
             scale_encoding="float32",
         )
 
-        fp8_view, scale_view = self._index_k_with_scale_block_views(buf)
+        fp8_view, scale_view = self._index_k_block_views(buf)
         loc = loc.to(torch.long)
         page = loc // self.page_size
         slot_in_page = loc % self.page_size
@@ -308,10 +286,6 @@ class DSATokenToKVPool(MLATokenToKVPool):
             data_lens.append(buf.nbytes)
             item_lens.append(buf[0].nbytes * self.page_size)
         for buf in self.index_k_buffer:
-            data_ptrs.append(buf.data_ptr())
-            data_lens.append(buf.nbytes)
-            item_lens.append(buf[0].nbytes * self.page_size)
-        for buf in self.index_k_with_scale_buffer:
             if buf is not None:
                 data_ptrs.append(buf.data_ptr())
                 data_lens.append(buf.nbytes)
@@ -328,10 +302,9 @@ class DSATokenToKVPool(MLATokenToKVPool):
             layer_offsets
             + [
                 start_idx + base_count + layer_id,
-                start_idx + base_count + self.layer_num + layer_id,
                 *(
-                    [start_idx + base_count + 2 * self.layer_num + layer_id]
-                    if self.index_k_with_scale_row_bytes > 0
+                    [start_idx + base_count + self.layer_num + layer_id]
+                    if self.index_k_row_bytes > 0
                     else []
                 ),
             ]

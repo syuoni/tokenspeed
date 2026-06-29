@@ -33,6 +33,9 @@ _SPARSE_DECODE_FP8_QUANT_BLOCK = 128
 _SPARSE_DECODE_FP8_SCALE_BYTES = torch._utils._element_size(torch.float32)
 _SPARSE_DECODE_ROPE_BYTES = torch._utils._element_size(torch.bfloat16)
 
+_INDEX_K_FP8_GROUP_SIZE = 128
+_INDEX_K_SCALE_BYTES = torch._utils._element_size(torch.float32)
+
 
 def _is_blackwell_device(device: str) -> bool:
     if not torch.cuda.is_available() or not str(device).startswith("cuda"):
@@ -65,6 +68,18 @@ def dsa_sparse_decode_row_bytes(
     )
 
 
+def dsa_index_k_row_bytes(index_head_dim: int) -> int:
+    if index_head_dim % _INDEX_K_FP8_GROUP_SIZE != 0:
+        raise ValueError(
+            "DSA index_head_dim must be divisible by "
+            f"{_INDEX_K_FP8_GROUP_SIZE}, got {index_head_dim}"
+        )
+    return (
+        index_head_dim
+        + index_head_dim // _INDEX_K_FP8_GROUP_SIZE * _INDEX_K_SCALE_BYTES
+    )
+
+
 @dataclass
 class DSAConfig(MLAConfig):
     index_topk: int
@@ -94,12 +109,14 @@ class DSAConfig(MLAConfig):
         )
 
     def cache_cell_size(self) -> int:
-        index_cell_size = self.index_head_dim * torch._utils._element_size(self.dtype)
         sparse_decode_cell_size = dsa_sparse_decode_row_bytes(
             self.kv_lora_rank,
             self.qk_rope_head_dim,
         )
-        return super().cache_cell_size() + index_cell_size + sparse_decode_cell_size
+        index_k_cell_size = dsa_index_k_row_bytes(
+            self.index_head_dim,
+        )
+        return super().cache_cell_size() + sparse_decode_cell_size + index_k_cell_size
 
     def create_pool(
         self,
