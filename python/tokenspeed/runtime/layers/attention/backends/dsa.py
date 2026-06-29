@@ -92,11 +92,12 @@ class DSABackend(AttentionBackend):
 
     @property
     def _block_table_aliased(self):
-        return getattr(self._dense_backend, "_block_table_aliased", False)
+        return self._dense_backend._block_table_aliased
 
     @_block_table_aliased.setter
     def _block_table_aliased(self, value):
-        self._dense_backend._block_table_aliased = value
+        if hasattr(self, "_dense_backend"):
+            self._dense_backend._block_table_aliased = value
 
     def register_step_counter(self, step_counter):
         super().register_step_counter(step_counter)
