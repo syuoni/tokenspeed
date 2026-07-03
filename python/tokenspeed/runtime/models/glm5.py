@@ -41,7 +41,7 @@ from tokenspeed.runtime.distributed import Mapping
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-from tokenspeed.runtime.layers.layernorm import FusedRMSNorm, RMSNorm
+from tokenspeed.runtime.layers.layernorm import FusedRMSNorm, LayerNorm, RMSNorm
 from tokenspeed.runtime.layers.linear import (
     MergedColumnParallelLinear,
     ReplicatedLinear,
@@ -253,7 +253,7 @@ class GlmDsaIndexer(nn.Module):
             prefix=add_prefix("wk_weights_proj", prefix),
         )
         self._wk_weights_proj_loaded = False
-        self.k_norm = nn.LayerNorm(self.index_head_dim, eps=1e-6)
+        self.k_norm = LayerNorm(self.index_head_dim, eps=1e-6)
 
         rope_scaling = _glm_dsa_rope_scaling(rope_scaling)
         self.rotary_emb = get_rope(
