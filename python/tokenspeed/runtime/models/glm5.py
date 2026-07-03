@@ -264,26 +264,9 @@ class GlmDsaIndexer(nn.Module):
             rope_scaling=rope_scaling,
             is_neox_style=not getattr(config, "indexer_rope_interleave", False),
         )
-        if hasattr(self.rotary_emb, "forward_cuda"):
-            self.rotary_emb.forward = self.rotary_emb.forward_cuda
 
     def set_wk_weights_proj_loaded(self, loaded: bool = True) -> None:
         self._wk_weights_proj_loaded = bool(loaded)
-
-    def _compute_index_k_and_weights(
-        self,
-        hidden_states: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if self._wk_weights_proj_loaded:
-            key_weights, _ = self.wk_weights_proj(hidden_states)
-            return key_weights.split(
-                [self.index_head_dim, self.index_n_heads],
-                dim=-1,
-            )
-
-        index_k, _ = self.wk(hidden_states)
-        weights, _ = self.weights_proj(hidden_states)
-        return index_k, weights
 
     def forward(
         self,
@@ -291,19 +274,27 @@ class GlmDsaIndexer(nn.Module):
         q_lora: torch.Tensor,
         positions: torch.Tensor,
     ) -> GlmDsaIndexerOutput:
-        index_q, _ = self.wq_b(q_lora)
+        index_q = self.wq_b(q_lora)[0]
         index_q = index_q.view(-1, self.index_n_heads, self.index_head_dim)
-        index_k, weights = self._compute_index_k_and_weights(hidden_states)
+        if self._wk_weights_proj_loaded:
+            key_weights = self.wk_weights_proj(hidden_states)[0]
+            index_k, weights = key_weights.split(
+                [self.index_head_dim, self.index_n_heads],
+                dim=-1,
+            )
+        else:
+            index_k = self.wk(hidden_states)[0]
+            weights = self.weights_proj(hidden_states)[0]
         index_k = self.k_norm(index_k)
 
-        if positions.numel() > 0:
-            q_rope, k_rope = self.rotary_emb(
-                positions,
-                index_q[..., : self.rope_head_dim],
-                index_k[:, None, : self.rope_head_dim],
-            )
-            index_q[..., : self.rope_head_dim] = q_rope
-            index_k[:, : self.rope_head_dim] = k_rope.squeeze(1)
+        q_rope, k_rope = self.rotary_emb(
+            positions,
+            index_q[..., : self.rope_head_dim],
+            index_k[:, None, : self.rope_head_dim],
+        )
+        # Noops if the RoPE is in-place applied
+        index_q[..., : self.rope_head_dim] = q_rope
+        index_k[:, : self.rope_head_dim] = k_rope.squeeze(1)
 
         index_q, index_k = _glm_dsa_hadamard_rotate_pair(index_q, index_k)
         return GlmDsaIndexerOutput(
