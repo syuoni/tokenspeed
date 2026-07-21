@@ -82,6 +82,12 @@ tokenspeed serve nvidia/MiniMax-M3-NVFP4 \
     --disable-cuda-graph-padding \
     --attention-backend trtllm \
     --moe-backend flashinfer_trtllm \
+    --speculative-algorithm EAGLE3 \
+    --speculative-draft-model-path Inferact/MiniMax-M3-EAGLE3 \
+    --speculative-num-steps 3 \
+    --speculative-eagle-topk 1 \
+    --speculative-num-draft-tokens 4 \
+    --drafter-attention-backend fa4 \
     --disable-prefill-graph \
     --disable-kvstore \
     --block-size 128 \
