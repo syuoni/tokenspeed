@@ -9,6 +9,10 @@ import math
 
 import pytest
 import torch
+from tokenspeed_kernel.ops.attention import (
+    msa_decode_with_kvcache,
+    msa_extend_with_kvcache,
+)
 from tokenspeed_kernel.ops.attention.triton.minimax_indexer import minimax_indexer
 from tokenspeed_kernel.ops.attention.triton.minimax_sparse_attention import (
     minimax_sparse_attention,
@@ -258,7 +262,14 @@ def test_msa_prefill_and_decode_after_2048() -> None:
 
 
 @requires_cuda
-def test_msa_decode_qlen4_verify_matches_per_token_decode() -> None:
+@pytest.mark.parametrize(
+    "kv_cache_dtype",
+    [torch.bfloat16, torch.float8_e4m3fn],
+    ids=["bf16", "fp8_e4m3"],
+)
+def test_msa_decode_qlen4_verify_matches_per_token_decode(
+    kv_cache_dtype: torch.dtype,
+) -> None:
     """Multi-query verify decode (q_len=4) must equal per-token decode.
 
     Verify token j at total length L is positioned like a plain decode step
@@ -296,6 +307,16 @@ def test_msa_decode_qlen4_verify_matches_per_token_decode() -> None:
             num_pages, 1, _BLOCK_SIZE, _HEAD_DIM, dtype=torch.bfloat16, device="cuda"
         )
         value_cache = torch.randn_like(key_cache)
+        if kv_cache_dtype is torch.float8_e4m3fn:
+            # Identity-scale quantization; e4m3 -> bf16 is exact, so the
+            # reference sees the same representable values as the kernel.
+            key_cache = key_cache.to(kv_cache_dtype)
+            value_cache = value_cache.to(kv_cache_dtype)
+            ref_key_cache = key_cache.to(torch.bfloat16)
+            ref_value_cache = value_cache.to(torch.bfloat16)
+        else:
+            ref_key_cache = key_cache
+            ref_value_cache = value_cache
         index_key_cache = torch.zeros(
             num_pages * _BLOCK_SIZE, _HEAD_DIM, dtype=torch.bfloat16, device="cuda"
         )
@@ -394,8 +415,8 @@ def test_msa_decode_qlen4_verify_matches_per_token_decode() -> None:
                 assert batched_blocks == single_blocks == expected_blocks
                 reference = _reference_sparse_attention(
                     query[token : token + 1],
-                    key_cache,
-                    value_cache,
+                    ref_key_cache,
+                    ref_value_cache,
                     batched_selected[token, 0],
                     block_table[request],
                     query_position,
@@ -412,5 +433,125 @@ def test_msa_decode_qlen4_verify_matches_per_token_decode() -> None:
                     atol=2e-3,
                     rtol=2e-2,
                 )
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = old_tf32
+
+
+@requires_cuda
+@pytest.mark.parametrize("phase", ["decode", "extend"])
+def test_msa_fp8_kv_descale_matches_dequant_reference(phase: str) -> None:
+    """FP8 K/V + descales must match the BF16 kernel on the dequantized cache.
+
+    The cache is quantized with known non-unit scales (K divided by 0.25, V by
+    0.5 before conversion, mirroring the write-side convention), so the run
+    without descales is a negative control: it must NOT match, proving the
+    scales are actually applied. Runs through the public dispatch ops, which
+    also proves the FP8 signature is selectable.
+    """
+    torch.manual_seed(20260722)
+    old_tf32 = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = False
+    try:
+        k_scale, v_scale = 0.25, 0.5
+        prefix_len = 2305
+        new_tokens = 1 if phase == "decode" else 8
+        total_len = prefix_len + new_tokens
+        num_blocks = math.ceil(total_len / _BLOCK_SIZE)
+        num_pages = num_blocks + 1  # Physical page zero is the dummy page.
+        block_table = torch.arange(1, num_pages, dtype=torch.int32, device="cuda")[None]
+
+        key_ref = torch.randn(
+            num_pages, 1, _BLOCK_SIZE, _HEAD_DIM, dtype=torch.bfloat16, device="cuda"
+        )
+        value_ref = torch.randn_like(key_ref)
+        key_fp8 = (key_ref.float() / k_scale).to(torch.float8_e4m3fn)
+        value_fp8 = (value_ref.float() / v_scale).to(torch.float8_e4m3fn)
+        key_dequant = (key_fp8.float() * k_scale).to(torch.bfloat16)
+        value_dequant = (value_fp8.float() * v_scale).to(torch.bfloat16)
+
+        index_key_cache = torch.zeros(
+            num_pages * _BLOCK_SIZE, _HEAD_DIM, dtype=torch.bfloat16, device="cuda"
+        )
+        prefix_positions = torch.arange(prefix_len, device="cuda")
+        prefix_slots = (
+            prefix_positions // _BLOCK_SIZE + 1
+        ) * _BLOCK_SIZE + prefix_positions % _BLOCK_SIZE
+        index_key_cache[prefix_slots] = torch.randn(
+            prefix_len, _HEAD_DIM, dtype=torch.bfloat16, device="cuda"
+        )
+
+        new_positions = torch.arange(prefix_len, total_len, device="cuda")
+        slot_mapping = (
+            (new_positions // _BLOCK_SIZE + 1) * _BLOCK_SIZE
+            + new_positions % _BLOCK_SIZE
+        ).to(torch.int32)
+        seq_lens = torch.tensor([total_len], dtype=torch.int32, device="cuda")
+        query = torch.randn(
+            new_tokens, 16, _HEAD_DIM, dtype=torch.bfloat16, device="cuda"
+        )
+        index_query = torch.randn(
+            new_tokens, 1, _HEAD_DIM, dtype=torch.bfloat16, device="cuda"
+        )
+        index_key = torch.randn(
+            new_tokens, _HEAD_DIM, dtype=torch.bfloat16, device="cuda"
+        )
+
+        common = dict(
+            index_q=index_query,
+            index_k=index_key,
+            index_k_cache=index_key_cache,
+            slot_mapping=slot_mapping,
+            page_table=block_table,
+            cache_seqlens=seq_lens,
+            topk=_TOPK,
+            page_size=_BLOCK_SIZE,
+            index_scale=_HEAD_DIM**-0.5,
+            attention_scale=_HEAD_DIM**-0.5,
+            init_blocks=0,
+            local_blocks=1,
+        )
+        if phase == "decode":
+            op = msa_decode_with_kvcache
+            common.update(max_seqlen_q=1, max_seqlen_k=total_len)
+        else:
+            op = msa_extend_with_kvcache
+            common.update(
+                cu_seqlens_q=torch.tensor(
+                    [0, new_tokens], dtype=torch.int32, device="cuda"
+                ),
+                prefix_lens=torch.tensor(
+                    [prefix_len], dtype=torch.int32, device="cuda"
+                ),
+                max_seqlen_q=new_tokens,
+                max_seqlen_k=total_len,
+            )
+
+        got = op(
+            q=query,
+            k_cache=key_fp8,
+            v_cache=value_fp8,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            **common,
+        )
+        reference = op(q=query, k_cache=key_dequant, v_cache=value_dequant, **common)
+        unscaled = op(q=query, k_cache=key_fp8, v_cache=value_fp8, **common)
+
+        torch.testing.assert_close(got, reference, atol=2e-2, rtol=2e-2)
+        assert not torch.allclose(unscaled, reference, atol=2e-2, rtol=2e-2)
+
+        with pytest.raises(ValueError, match="only valid with an FP8 KV cache"):
+            minimax_sparse_attention(
+                query,
+                key_dequant,
+                value_dequant,
+                torch.zeros((new_tokens, 1, _TOPK), dtype=torch.int32, device="cuda"),
+                block_table,
+                seq_lens,
+                scale=_HEAD_DIM**-0.5,
+                decode_query_len=new_tokens,
+                k_scale=k_scale,
+                v_scale=v_scale,
+            )
     finally:
         torch.backends.cuda.matmul.allow_tf32 = old_tf32
