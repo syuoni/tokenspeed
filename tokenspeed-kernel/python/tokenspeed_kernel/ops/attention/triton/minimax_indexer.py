@@ -14,8 +14,24 @@ from __future__ import annotations
 import torch
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.ops.attention.triton.dsa_topk import _topk_with_padding
+from tokenspeed_kernel.platform import current_platform
 
 SPARSE_BLOCK_SIZE = 128
+
+if current_platform().is_blackwell:
+    try:
+        from tokenspeed_kernel.ops.attention.cute_dsl.minimax_index_decode_score import (
+            decode_score_supported as _cutedsl_decode_score_supported,
+        )
+        from tokenspeed_kernel.ops.attention.cute_dsl.minimax_index_decode_score import (
+            minimax_index_decode_score as _cutedsl_decode_score,
+        )
+    except ImportError:
+        _cutedsl_decode_score = None
+        _cutedsl_decode_score_supported = None
+else:
+    _cutedsl_decode_score = None
+    _cutedsl_decode_score_supported = None
 
 
 @triton.jit
@@ -382,37 +398,52 @@ def minimax_indexer(
                 f"tokens={tokens}, requests={seq_lens.numel()}, "
                 f"decode_query_len={decode_query_len}"
             )
-        num_chunks = 64
-        block_q = triton.next_power_of_2(decode_query_len)
-        _decode_block_score_kernel[(seq_lens.numel(), num_chunks)](
-            index_q,
-            cache_pages,
-            scores,
-            block_table,
-            seq_lens,
-            num_index_heads=num_heads,
-            scale=float(scale),
-            init_blocks=int(init_blocks),
-            local_blocks=int(local_blocks),
-            decode_query_len=decode_query_len,
-            max_blocks=max_blocks,
-            num_chunks=num_chunks,
-            stride_q_n=index_q.stride(0),
-            stride_q_h=index_q.stride(1),
-            stride_q_d=index_q.stride(2),
-            stride_k_page=cache_pages.stride(0),
-            stride_k_pos=cache_pages.stride(1),
-            stride_k_d=cache_pages.stride(2),
-            stride_s_n=scores.stride(0),
-            stride_s_h=scores.stride(1),
-            stride_s_b=scores.stride(2),
-            stride_bt_b=block_table.stride(0),
-            head_dim=head_dim,
-            BLOCK_Q=block_q,
-            BLOCK_K=SPARSE_BLOCK_SIZE,
-            num_warps=4,
-            num_stages=2,
-        )
+        if _cutedsl_decode_score is not None and _cutedsl_decode_score_supported(
+            index_q, cache_pages, decode_query_len, max_blocks
+        ):
+            _cutedsl_decode_score(
+                index_q,
+                cache_pages,
+                scores,
+                block_table,
+                seq_lens,
+                scale=float(scale),
+                init_blocks=int(init_blocks),
+                local_blocks=int(local_blocks),
+                decode_query_len=decode_query_len,
+            )
+        else:
+            num_chunks = 64
+            block_q = triton.next_power_of_2(decode_query_len)
+            _decode_block_score_kernel[(seq_lens.numel(), num_chunks)](
+                index_q,
+                cache_pages,
+                scores,
+                block_table,
+                seq_lens,
+                num_index_heads=num_heads,
+                scale=float(scale),
+                init_blocks=int(init_blocks),
+                local_blocks=int(local_blocks),
+                decode_query_len=decode_query_len,
+                max_blocks=max_blocks,
+                num_chunks=num_chunks,
+                stride_q_n=index_q.stride(0),
+                stride_q_h=index_q.stride(1),
+                stride_q_d=index_q.stride(2),
+                stride_k_page=cache_pages.stride(0),
+                stride_k_pos=cache_pages.stride(1),
+                stride_k_d=cache_pages.stride(2),
+                stride_s_n=scores.stride(0),
+                stride_s_h=scores.stride(1),
+                stride_s_b=scores.stride(2),
+                stride_bt_b=block_table.stride(0),
+                head_dim=head_dim,
+                BLOCK_Q=block_q,
+                BLOCK_K=SPARSE_BLOCK_SIZE,
+                num_warps=4,
+                num_stages=2,
+            )
     else:
         if cu_seqlens_q is None or prefix_lens is None or max_query_len <= 0:
             raise ValueError(
