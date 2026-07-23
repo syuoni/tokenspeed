@@ -14,13 +14,14 @@ from __future__ import annotations
 
 import pytest
 import torch
+from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.thirdparty.cuda.minimax_m3_fused import (
     fused_qknorm_rope_kv_insert,
 )
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(),
-    reason="requires CUDA and the built minimax_m3_fused kernel",
+    not current_platform().is_nvidia,
+    reason="minimax_m3_fused kernel is NVIDIA-only",
 )
 
 HD, RD, EPS = 128, 64, 1e-6
