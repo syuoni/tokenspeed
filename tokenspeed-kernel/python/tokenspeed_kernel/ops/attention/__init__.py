@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 
 # Backend registration (side-effect imports)
 import tokenspeed_kernel.ops.attention.cuda  # noqa: F401
@@ -286,6 +287,8 @@ def msa_extend_with_kvcache(
     local_blocks: int,
     k_scale: float | torch.Tensor | None = None,
     v_scale: float | torch.Tensor | None = None,
+    query_lens_cpu: Sequence[int] | None = None,
+    seq_lens_cpu: Sequence[int] | None = None,
     override: str | None = None,
     solution: str | None = None,
 ) -> torch.Tensor:
@@ -319,6 +322,10 @@ def msa_extend_with_kvcache(
             divided by this scale before quantization. None means 1.0.
         v_scale: Optional scalar descale for an FP8 ``v_cache``, with the
             same convention as ``k_scale``.
+        query_lens_cpu: Optional host-side per-request new-token counts;
+            with ``seq_lens_cpu`` this lets the indexer plan its fmha
+            OnlyScore path without a device sync.
+        seq_lens_cpu: Optional host-side per-request total sequence lengths.
         override: Optional kernel override name.
         solution: Optional kernel solution to force through normal selection.
 
@@ -401,6 +408,8 @@ def msa_extend_with_kvcache(
             local_blocks=local_blocks,
             k_scale=k_scale,
             v_scale=v_scale,
+            query_lens_cpu=query_lens_cpu,
+            seq_lens_cpu=seq_lens_cpu,
         )
 
 
