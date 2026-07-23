@@ -56,6 +56,7 @@ def fused_qknorm_rope_kv_insert(
     index_q_out: torch.Tensor | None = None,
     kv_cache_dtype: str = "auto",
     skip_index_branch: bool = False,
+    enable_pdl: bool = False,
 ) -> None:
     """Fused Gemma qk-norm + partial-NeoX RoPE (main q/k + index q/k), with
     optional K/V and index-K cache scatter-insert.
@@ -66,6 +67,10 @@ def fused_qknorm_rope_kv_insert(
     contiguous ``q_out`` / ``index_q_out`` receive the de-interleaved outputs.
     Norm weights are the folded Gemma weights (``1 + w``). ``cos_sin_cache`` is
     ``[max_pos, rotary_dim]`` ([cos | sin] halves) in the qkv dtype.
+
+    ``enable_pdl`` requests Programmatic Dependent Launch (SM90+); when False the
+    kernel launches without the stream-serialization attribute (its in-body
+    grid-dependency intrinsics become no-ops).
     """
     if qkv.dtype not in (torch.float16, torch.bfloat16):
         raise TypeError(f"qkv must be float16 or bfloat16, got {qkv.dtype}")
@@ -102,4 +107,5 @@ def fused_qknorm_rope_kv_insert(
         index_q_out,
         int(code),
         bool(skip_index_branch),
+        bool(enable_pdl),
     )

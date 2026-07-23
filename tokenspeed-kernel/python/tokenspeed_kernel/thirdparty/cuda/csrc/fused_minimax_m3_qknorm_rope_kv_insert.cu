@@ -475,7 +475,8 @@ void launchFusedMiniMaxM3(
     int const num_tokens, int const nq, int const nkv, int const niq,
     int const block_size, int64_t const kv_s_slot, int64_t const kv_s_head,
     int64_t const kv_s_dim, bool const has_index, bool const insert_kv,
-    bool const process_index, bool const fp8_idx, cudaStream_t stream) {
+    bool const process_index, bool const fp8_idx, bool const enable_pdl,
+    cudaStream_t stream) {
   // Index outputs are scalar_t (bf16) or e4m3 bytes (uint8_t); reinterpret the
   // void* pointers per instantiation in the LAUNCH macro.
   // Slot count must match the kernel's compile-time gating.
@@ -492,9 +493,9 @@ void launchFusedMiniMaxM3(
   if (grid == 0) return;
 
 #ifndef USE_ROCM
-  // PDL: enable programmatic stream serialization whenever the hardware
-  // supports it (SM90+).  On pre-Hopper GPUs the attribute is unavailable, so
-  // leave numAttrs = 0 and launch as a regular kernel via cudaLaunchKernelEx.
+  // PDL: enable programmatic stream serialization when the caller requests it
+  // and the hardware supports it (SM90+).  Otherwise leave numAttrs = 0 and
+  // launch as a regular kernel via cudaLaunchKernelEx.
   static int const sm_version = getSMVersion();
   cudaLaunchConfig_t config;
   config.gridDim = dim3(grid);
@@ -505,7 +506,7 @@ void launchFusedMiniMaxM3(
   attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
   attrs[0].val.programmaticStreamSerializationAllowed = 1;
   config.attrs = attrs;
-  config.numAttrs = (sm_version >= 90) ? 1 : 0;
+  config.numAttrs = (enable_pdl && sm_version >= 90) ? 1 : 0;
 
   #define LAUNCH(HAS_INDEX, INSERT, PROCESS_INDEX, FP8, OUT_T)                 \
     cudaLaunchKernelEx(                                                        \
@@ -583,7 +584,7 @@ void fused_minimax_m3_qknorm_rope_kv_insert(
     Optional<TensorView> index_cache,
     int64_t block_size, Optional<TensorView> q_out,
     Optional<TensorView> index_q_out, int64_t kv_cache_dtype,
-    bool skip_index_branch) {
+    bool skip_index_branch, bool enable_pdl) {
   namespace mm = vllm::minimax_m3_fused_ops;
   constexpr int kHeadDim = mm::kHeadDim;
 
@@ -710,7 +711,7 @@ void fused_minimax_m3_qknorm_rope_kv_insert(
       reinterpret_cast<CACHE_T*>(v_cache_ptr), index_cache_ptr,              \
       static_cast<float>(eps), static_cast<int>(rotary_dim), num_tokens, nq,  \
       nkv, niq, static_cast<int>(block_size), kv_s_slot, kv_s_head, kv_s_dim, \
-      has_index, insert_kv, process_index, fp8_idx, stream)
+      has_index, insert_kv, process_index, fp8_idx, enable_pdl, stream)
 
 #define TS_DISPATCH_KV(ST)                                                    \
   if (kv_dt == vllm::Fp8KVCacheDataType::kAuto)                               \

@@ -732,6 +732,7 @@ class MiniMaxM3Attention(nn.Module):
             num_index_heads=self.indexer.num_index_heads,
             q_out=q_out,
             index_q_out=index_q_out,
+            enable_pdl=pdl_enabled(),
         )
         _, k, v, _, index_k = qkv.split(
             [
