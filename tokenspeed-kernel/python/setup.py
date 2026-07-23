@@ -889,6 +889,12 @@ setup(
             "cute/**/*.cu",
             "cute/README.md",
             "cute/requirements.txt",
+            # nvcc-JIT FMHA sources: compiled at runtime by jit.py, so the
+            # kernel sources and headers must ship with the wheel.
+            "csrc/*.cu",
+            "csrc/*.h",
+            "csrc/*.jinja",
+            "csrc/include/*",
         ],
     },
     cmdclass={

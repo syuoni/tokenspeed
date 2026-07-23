@@ -11,6 +11,8 @@ softmax states, preserving exact attention over the selected tokens.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 import torch
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.ops.attention.triton.minimax_indexer import (
@@ -733,6 +735,8 @@ def triton_minimax_msa_extend_with_kvcache(
     local_blocks: int,
     k_scale: float | torch.Tensor | None = None,
     v_scale: float | torch.Tensor | None = None,
+    query_lens_cpu: Sequence[int] | None = None,
+    seq_lens_cpu: Sequence[int] | None = None,
 ) -> torch.Tensor:
     """Run MiniMax sparse-attention extend over paged caches."""
 
@@ -755,6 +759,8 @@ def triton_minimax_msa_extend_with_kvcache(
         prefix_lens=prefix_lens,
         max_query_len=max_seqlen_q,
         max_blocks=max_blocks,
+        query_lens_cpu=query_lens_cpu,
+        seq_lens_cpu=seq_lens_cpu,
     )
     return minimax_sparse_attention(
         q,

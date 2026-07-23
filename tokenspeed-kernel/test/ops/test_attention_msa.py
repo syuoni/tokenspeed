@@ -853,3 +853,146 @@ def test_cutedsl_decode_score_gates() -> None:
     assert not decode_score_supported(q, pages, 1, 7)
     # Dtype mismatch between queries and cache.
     assert not decode_score_supported(q, pages.to(torch.float8_e4m3fn), 1, 8)
+
+
+def _fmha_prefill_score_available() -> bool:
+    from tokenspeed_kernel.platform import current_platform
+
+    if not torch.cuda.is_available() or not current_platform().is_blackwell:
+        return False
+    try:
+        import tokenspeed_kernel.thirdparty.msa.jit  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+requires_fmha_prefill_score = pytest.mark.skipif(
+    not _fmha_prefill_score_available(),
+    reason="fmha OnlyScore prefill scorer requires SM100 and the vendored "
+    "msa JIT stack",
+)
+
+
+def _prefill_indexer_case(
+    qo_lens: list[int],
+    kv_lens: list[int],
+    query_lens_cpu: list[int] | None,
+    seq_lens_cpu: list[int] | None,
+) -> torch.Tensor:
+    device = "cuda"
+    heads, head_dim, block_k = 4, 128, 128
+    requests = len(qo_lens)
+    tokens = sum(qo_lens)
+    max_blocks = (max(kv_lens) + block_k - 1) // block_k
+    pages_per_req = [(k + block_k - 1) // block_k for k in kv_lens]
+    total_pages = sum(pages_per_req)
+    generator = torch.Generator(device=device).manual_seed(7)
+    perm = torch.randperm(total_pages, device=device, generator=generator).to(
+        torch.int32
+    )
+    block_table = torch.zeros(requests, max_blocks, device=device, dtype=torch.int32)
+    offset = 0
+    for request, num_pages in enumerate(pages_per_req):
+        block_table[request, :num_pages] = perm[offset : offset + num_pages]
+        offset += num_pages
+    index_k_cache = torch.randn(
+        total_pages * block_k,
+        head_dim,
+        device=device,
+        dtype=torch.bfloat16,
+        generator=generator,
+    )
+    index_q = torch.randn(
+        tokens,
+        heads,
+        head_dim,
+        device=device,
+        dtype=torch.bfloat16,
+        generator=generator,
+    )
+    index_k = torch.randn(
+        tokens, head_dim, device=device, dtype=torch.bfloat16, generator=generator
+    )
+    slots = []
+    for request, (query_len, kv_len) in enumerate(zip(qo_lens, kv_lens)):
+        for position in range(kv_len - query_len, kv_len):
+            page = int(block_table[request, position // block_k].item())
+            slots.append(page * block_k + position % block_k)
+    slot_mapping = torch.tensor(slots, device=device, dtype=torch.int32)
+    seq_lens = torch.tensor(kv_lens, device=device, dtype=torch.int32)
+    cu_seqlens_q = torch.zeros(requests + 1, device=device, dtype=torch.int32)
+    cu_seqlens_q[1:] = torch.cumsum(torch.tensor(qo_lens, device=device), 0)
+    prefix_lens = torch.tensor(
+        [k - q for q, k in zip(qo_lens, kv_lens)], device=device, dtype=torch.int32
+    )
+    return minimax_indexer(
+        index_q,
+        index_k,
+        index_k_cache,
+        slot_mapping,
+        block_table,
+        seq_lens,
+        topk=16,
+        scale=head_dim**-0.5,
+        init_blocks=1,
+        local_blocks=2,
+        cu_seqlens_q=cu_seqlens_q,
+        prefix_lens=prefix_lens,
+        max_query_len=max(qo_lens),
+        max_blocks=max_blocks,
+        query_lens_cpu=query_lens_cpu,
+        seq_lens_cpu=seq_lens_cpu,
+    )
+
+
+@requires_fmha_prefill_score
+@pytest.mark.parametrize(
+    "qo_lens,kv_lens",
+    [
+        ([600], [20000]),
+        ([1024, 512], [50000, 30000]),
+        ([40], [70000]),
+    ],
+)
+def test_fmha_prefill_score_matches_triton(
+    qo_lens: list[int], kv_lens: list[int]
+) -> None:
+    from tokenspeed_kernel.ops.attention import msa_score
+
+    if not msa_score.ensure_prefill_score_ready(None):
+        pytest.skip("fmha OnlyScore JIT compilation failed (nvcc unavailable?)")
+
+    torch.manual_seed(0)
+    plan_cache_before = msa_score._plan_for_batch.cache_info().currsize
+    fmha_selected = _prefill_indexer_case(qo_lens, kv_lens, qo_lens, kv_lens)
+    assert (
+        msa_score._plan_for_batch.cache_info().currsize > plan_cache_before
+        or msa_score._plan_for_batch.cache_info().hits > 0
+    ), "fmha OnlyScore path was not taken"
+    triton_selected = _prefill_indexer_case(qo_lens, kv_lens, None, None)
+
+    # Selections are compared as sets: fmha/sparse_topk_select emits ascending
+    # block ids with -1 padding, the Triton top-k emits score order.
+    assert torch.equal(
+        fmha_selected.sort(dim=-1).values, triton_selected.sort(dim=-1).values
+    )
+
+
+@requires_fmha_prefill_score
+def test_fmha_prefill_score_gates() -> None:
+    from tokenspeed_kernel.ops.attention.msa_score import prefill_score_supported
+
+    device = "cuda"
+    index_q = torch.randn(8, 4, 128, device=device, dtype=torch.bfloat16)
+    pages = torch.randn(256, 128, 128, device=device, dtype=torch.bfloat16)
+    # Host lens are required for sync-free planning.
+    assert not prefill_score_supported(index_q, pages, 16, 256, None, None)
+    # Upstream top-k only supports topk == 16.
+    assert not prefill_score_supported(index_q, pages, 32, 256, [8], [32000])
+    # Below the measured crossover the Triton pair is faster.
+    assert not prefill_score_supported(index_q, pages, 16, 64, [8], [8192])
+    # FP8 index cache is stage 3.
+    assert not prefill_score_supported(
+        index_q, pages.to(torch.float8_e4m3fn), 16, 256, [8], [32000]
+    )

@@ -84,6 +84,9 @@ class MSAExtendMetadata:
     extend_prefix_lens: torch.Tensor
     extend_seq_lens_cpu: list[int]
     cu_extend_seq_lens_cpu: list[int]
+    # Per-request total lengths (prefix + new tokens) on the host, so kernels
+    # can plan host-side without a device sync.
+    seq_lens_cpu: list[int]
     max_extend_seq_len: int
     max_extend_prefix_len: int = 0
     # Flat per-group page tables (group_id -> [num_reqs, max_pages]); None on
@@ -239,7 +242,9 @@ class MSAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
             )
             extend_prefix_lens = extend_prefix_lens[:bs]
             max_extend_seq_len = max(extend_seq_lens_cpu)
-            max_extend_prefix_len = int(extend_prefix_lens_cpu[:bs].max().item())
+            prefix_lens_cpu = [int(x) for x in extend_prefix_lens_cpu[:bs].tolist()]
+            max_extend_prefix_len = max(prefix_lens_cpu)
+            seq_lens_cpu = [p + e for p, e in zip(prefix_lens_cpu, extend_seq_lens_cpu)]
 
             self.forward_extend_metadata = MSAExtendMetadata(
                 page_table=page_table,
@@ -250,6 +255,7 @@ class MSAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
                 extend_prefix_lens=extend_prefix_lens,
                 extend_seq_lens_cpu=extend_seq_lens_cpu,
                 cu_extend_seq_lens_cpu=cu_extend_seq_lens_cpu,
+                seq_lens_cpu=seq_lens_cpu,
                 max_extend_seq_len=max_extend_seq_len,
                 max_extend_prefix_len=max_extend_prefix_len,
                 page_tables=flat_page_tables,
@@ -631,6 +637,8 @@ class MSAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
             local_blocks=self.index_local_blocks,
             k_scale=layer.k_scale if self.is_fp8 else None,
             v_scale=layer.v_scale if self.is_fp8 else None,
+            query_lens_cpu=metadata.extend_seq_lens_cpu,
+            seq_lens_cpu=metadata.seq_lens_cpu,
         )
         return self._reshape_and_pad_output(output, total_tokens, layer)
 
