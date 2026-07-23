@@ -63,9 +63,9 @@ def _store_index_k_kernel(
     ENABLE_PDL: tl.constexpr,
 ):
     token = tl.program_id(0)
+    dims = tl.arange(0, BLOCK_D)
     if ENABLE_PDL:
         tl.extra.cuda.gdc_wait()
-    dims = tl.arange(0, BLOCK_D)
     slot = tl.load(slot_mapping + token).to(tl.int64)
     values = tl.load(
         index_k + token * stride_k_n + dims * stride_k_d,
@@ -562,7 +562,9 @@ def minimax_indexer(
             num_stages=2,
         )
 
-    selected = _topk_with_padding(scores.view(tokens * num_heads, max_blocks), topk)
+    selected = _topk_with_padding(
+        scores.view(tokens * num_heads, max_blocks), topk, enable_pdl=enable_pdl
+    )
     return selected.view(tokens, num_heads, int(topk))
 
 
