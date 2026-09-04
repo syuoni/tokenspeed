@@ -2,8 +2,10 @@
 """Collect a sweep's per-config benchmark_summary.json files into one CSV."""
 
 import argparse
+import base64
 import csv
 import json
+import pickle
 import re
 import sqlite3
 import sys
@@ -26,8 +28,43 @@ def num_gpus_from_config(config: str) -> int:
     return int(m.group(1))
 
 
+def token_chunks(response_messages) -> int:
+    """Number of streamed chunks that carried generated text.
+
+    evalscope stores every SSE payload with ``choices`` in ``response_messages``
+    (base64 pickle). The role-only first chunk and the finish chunk carry no
+    tokens, so counting them (as ``inter_token_latencies`` does) adds one
+    iteration per request and understates accept length by ~1%.
+    """
+    try:
+        chunks = pickle.loads(base64.b64decode(response_messages))
+    except Exception:
+        return -1
+    n = 0
+    for chunk in chunks:
+        choices = chunk.get("choices") or []
+        if not choices:
+            continue
+        choice = choices[0]
+        if chunk.get("object") == "text_completion":
+            text = choice.get("text")
+        else:
+            delta = choice.get("delta") or {}
+            text = (delta.get("content") or "") + (delta.get("reasoning_content") or "")
+        if text:
+            n += 1
+    return n
+
+
 def decoded_tok_per_iter(run_dir: Path) -> float:
-    """Iteration-weighted accept length: sum(completion-1) / sum(n_chunks-1).
+    """Iteration-weighted accept length: sum(completion-1) / sum(n_iters-1).
+
+    n_iters is the number of chunks that carried generated text, which is the
+    number of decode iterations when the gateway streams one chunk per
+    iteration (tokenspeed needs ``--reasoning-parser passthrough
+    --tool-call-parser passthrough`` for that; the kimi_k3 parsers merge and
+    drop chunks). Falls back to the inter-token-latency count when the stored
+    chunks cannot be decoded.
 
     The "Decoded Tok/Iter" in benchmark_summary.json is an unweighted
     per-request mean; high-accept requests take fewer iterations, so that
@@ -39,14 +76,15 @@ def decoded_tok_per_iter(run_dir: Path) -> float:
     con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     try:
         rows = con.execute(
-            "SELECT completion_tokens, inter_token_latencies"
+            "SELECT completion_tokens, inter_token_latencies, response_messages"
             " FROM result WHERE success = 1"
         ).fetchall()
     finally:
         con.close()
     toks = iters = 0
-    for ctok, itl_json in rows:
-        n_gaps = len(json.loads(itl_json))  # == n_chunks - 1
+    for ctok, itl_json, response_messages in rows:
+        n_chunks = token_chunks(response_messages)
+        n_gaps = n_chunks - 1 if n_chunks > 0 else len(json.loads(itl_json))
         if ctok and ctok > 1 and n_gaps > 0:
             toks += ctok - 1
             iters += n_gaps

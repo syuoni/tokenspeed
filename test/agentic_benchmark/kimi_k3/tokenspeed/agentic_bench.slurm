@@ -13,7 +13,7 @@ set -euo pipefail
 # Sweep configs
 CONFIGS=(
     attn_tp8_moe_tp8
-    attn_tp8_moe_ep8
+    # attn_tp8_moe_ep8
 )
 
 # Under sbatch this file runs from the spool directory; SLURM_SUBMIT_DIR is

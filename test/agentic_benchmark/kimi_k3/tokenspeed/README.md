@@ -17,6 +17,14 @@ python3 collect_outputs.py outputs/<sweep_ts>   # flat CSV, one row per (config,
 
 To narrow the matrix, comment out entries in the `CONFIGS=()` array.
 
+`Decoded Tok/Iter` in the CSV is iteration-weighted, `sum(completion-1) /
+sum(text_chunks-1)`, counting only streamed chunks that carried generated
+text; the role and finish chunks are not decode iterations. It equals the
+server-side accept length only when the gateway streams one chunk per
+iteration, which is why the configs pass `--reasoning-parser passthrough
+--tool-call-parser passthrough`. Cross-check against the `acc_len` field of
+the `--enable-log-request-stats` lines in the server log.
+
 ## Workload sizing
 
 The script builds the dataset with the kimi_k2.5 recipe (first turn 50,000

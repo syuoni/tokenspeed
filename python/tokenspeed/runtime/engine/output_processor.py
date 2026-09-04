@@ -52,6 +52,10 @@ from tokenspeed.runtime.engine.io_struct import (
 )
 from tokenspeed.runtime.engine.logprobs import LogprobsProcessor
 from tokenspeed.runtime.metrics.collector import RequestFinishStats
+from tokenspeed.runtime.utils.env import envs
+from tokenspeed.runtime.utils.k3_prompt_diag import filter_special_token_ids
+
+DIAG_FORCE_SKIP_SPECIAL_TOKENS = envs.TOKENSPEED_DIAG_FORCE_SKIP_SPECIAL_TOKENS.get()
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.engine.async_llm import AsyncLLM
@@ -307,6 +311,11 @@ class OutputProcessor:
                 state.finished_time = time.time()
                 meta_info["e2e_latency"] = state.finished_time - state.created_time
 
+            if DIAG_FORCE_SKIP_SPECIAL_TOKENS and "output_ids" in out_dict:
+                out_dict["output_ids"] = filter_special_token_ids(
+                    out_dict["output_ids"], self._diag_special_ids()
+                )
+
             state.collector.put(
                 out_dict, stream=bool(getattr(state.obj, "stream", False))
             )
@@ -323,6 +332,14 @@ class OutputProcessor:
                 and state.obj.log_metrics
             ):
                 self.dump_requests(state, out_dict)
+
+    def _diag_special_ids(self) -> frozenset[int]:
+        ids = getattr(self, "_diag_special_ids_cache", None)
+        if ids is None:
+            tokenizer = self.engine.tokenizer
+            ids = frozenset(getattr(tokenizer, "all_special_ids", None) or ())
+            self._diag_special_ids_cache = ids
+        return ids
 
     def collect_metrics(self, state: ReqState, recv_obj, i: int):
         completion_tokens = (

@@ -2,6 +2,11 @@
 
 set -euo pipefail
 
+# Emulate vLLM's front end until the smg router honors skip_special_tokens and
+# encodes message text without control tokens (see k3_prompt_diag.py).
+export TOKENSPEED_DIAG_VLLM_RENDER=1
+export TOKENSPEED_DIAG_FORCE_SKIP_SPECIAL_TOKENS=1
+
 exec ts serve \
     --model nvidia/Kimi-K3-NVFP4 \
     --attn-tp-size 8 \

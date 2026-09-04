@@ -40,6 +40,8 @@ from tokenspeed.runtime.grammar.reasoning_structural_tag import (
 from tokenspeed.runtime.multimodal.embedder import pad_input_tokens
 from tokenspeed.runtime.multimodal.mrope import compute_mrope_positions
 from tokenspeed.runtime.sampling.sampling_params import SamplingParams
+from tokenspeed.runtime.utils.env import envs
+from tokenspeed.runtime.utils.k3_prompt_diag import PromptRewriter, supports_rewrite
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.engine.async_llm import AsyncLLM
@@ -192,6 +194,22 @@ class InputProcessor:
         """
         return await asyncio.gather(*(self.tokenize_one_request(obj) for obj in objs))
 
+    def _diag_rewrite_prompt(self, input_ids):
+        rewriter = getattr(self, "_diag_prompt_rewriter", None)
+        if rewriter is None:
+            tokenizer = self.engine.tokenizer
+            if tokenizer is None or not supports_rewrite(tokenizer):
+                self.engine.logger.warning(
+                    "TOKENSPEED_DIAG_VLLM_RENDER set but the tokenizer has no "
+                    "encode(allow_special_tokens=...); prompt left unchanged"
+                )
+                self._diag_prompt_rewriter = False
+                return input_ids
+            rewriter = self._diag_prompt_rewriter = PromptRewriter(tokenizer)
+        if rewriter is False:
+            return input_ids
+        return rewriter(input_ids)
+
     async def tokenize_one_request(
         self,
         obj: GenerateReqInput | EmbeddingReqInput,
@@ -219,6 +237,9 @@ class InputProcessor:
                     "the engine with skip_tokenizer_init=False."
                 )
             input_ids = self.engine.tokenizer.encode(input_text)
+
+        if input_ids is not None and envs.TOKENSPEED_DIAG_VLLM_RENDER.get():
+            input_ids = self._diag_rewrite_prompt(input_ids)
 
         precomputed_mm = (
             isinstance(obj, GenerateReqInput)
@@ -319,6 +340,9 @@ class InputProcessor:
         sampling_params.resolve_seed(obj.rid)
         sampling_params.normalize(self.engine.tokenizer)
         sampling_params.verify(self.engine.model_config.vocab_size)
+
+        if envs.TOKENSPEED_DIAG_FORCE_SKIP_SPECIAL_TOKENS.get():
+            sampling_params.skip_special_tokens = True
 
         # Output logprobs: two request dialects, one compute path. vLLM uses
         # sampling_params.logprobs; SGLang uses GenerateReqInput.return_logprob
