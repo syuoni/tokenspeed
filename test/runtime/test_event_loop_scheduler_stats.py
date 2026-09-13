@@ -109,3 +109,7 @@ def test_scheduler_stats_partition_lcm_blocks(packing, active_parents, cached_pa
         "num_cached_pages": 0,
         "num_queue_reqs": 0,
     }
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

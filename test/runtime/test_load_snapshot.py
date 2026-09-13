@@ -648,3 +648,7 @@ def test_store_rejects_non_positive_dp_size():
     """A store must have at least one rank to form a complete replica."""
     with pytest.raises(ValueError, match="dp_size"):
         LoadSnapshotStore(dp_size=0)
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))
