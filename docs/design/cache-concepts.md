@@ -722,7 +722,9 @@ Enforced:
   between them (P divisibility, PD transfer policy, one-cache-block chunks for
   a recurrent-state group). The `Scheduler` runs it before constructing any
   member, because the pools and the coordinator assert on the same fields and
-  would otherwise preempt the diagnostic. Consequently `MakeSpecsFromConfig`
+  would otherwise preempt the diagnostic. Python callers must also pass
+  `Scheduler(config)` explicitly; the binding retains no module-lifetime
+  default configuration. Consequently `MakeSpecsFromConfig`
   is pure translation — it validates nothing;
 * the scheduler layer **transports** `cache_blocks_per_lcm_block` rather than
   reasoning with it. It appears in `csrc/scheduler/` only as a config field
