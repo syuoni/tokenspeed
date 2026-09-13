@@ -70,17 +70,6 @@ std::uint64_t NextTestAccessEpoch() {
     return ++next_access_epoch;
 }
 
-std::int32_t ScanAvailableLcmBlocks(const PrefixCacheIndex& index, const BlockPool& pool,
-                                    std::int32_t cache_blocks_per_lcm_block) {
-    std::int32_t available = 0;
-    for (std::int32_t parent_id = 1; parent_id <= pool.NumLcmBlocks(); ++parent_id) {
-        if (!pool.BoundGroup(parent_id) || index.ParentIsFullyEvictable(pool, parent_id, cache_blocks_per_lcm_block)) {
-            ++available;
-        }
-    }
-    return available;
-}
-
 CacheKey Key(const std::string& content_hash, std::uint32_t group_id, std::int32_t page_offset = 0) {
     return CacheKey{
         .group_id = group_id,
@@ -209,62 +198,29 @@ TEST(MakeCoordinatorTest, ManagersMayUseSmallerPagesThanTheCoordinatorDomain) {
     EXPECT_EQ(coordinator.GroupBlockGranularity(1), 2);
 }
 
-TEST(CacheCoordinatorCapacityTest, AvailableParentCountTracksCacheOwnershipAndPins) {
+// A parent held only by an unpinned cache entry is available to eviction but
+// not empty: the per-step gauge counts it as cached, the leak check as free.
+TEST(CacheCoordinatorCapacityTest, EmptyParentsExcludeCacheOnlyParents) {
     BlockPool pool(2, {2});
     const std::array specs{CacheGroupSpec{
         .kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 2, .block_granularity = 4}};
     CacheCoordinator coordinator = MakeCoordinator(specs, /*prefix_granularity=*/4, pool);
     PrefixCacheIndex& index = coordinator.GroupPrefixIndex(0);
     const CacheKey key = Key("cached", /*group_id=*/0);
-    const auto expect_available = [&](std::int32_t expected) {
-        EXPECT_EQ(coordinator.NumAvailableLcmBlocks(), expected);
-        EXPECT_EQ(coordinator.NumAvailableLcmBlocks(), ScanAvailableLcmBlocks(index, pool, 2));
-    };
 
-    expect_available(2);
     CacheBlockRef request_ref = pool.AcquireBlock(/*group_id=*/0);
-    expect_available(1);
-
     index.Register(pool, request_ref, key, /*access_epoch=*/1, /*logical_block_index=*/0, CacheBoundaryKind::kChunk,
                    /*newly_cached=*/nullptr);
-    expect_available(1);
+    EXPECT_EQ(coordinator.NumEmptyLcmBlocks(), 1);
+    EXPECT_EQ(coordinator.NumAvailableLcmBlocks(), 1);
 
     request_ref.reset();
-    expect_available(2);
+    EXPECT_EQ(coordinator.NumEmptyLcmBlocks(), 1);
+    EXPECT_EQ(coordinator.NumAvailableLcmBlocks(), 2);
 
-    CacheBlockRef pinned = index.Find(pool, key);
-    ASSERT_TRUE(pinned);
-    expect_available(1);
-
-    pinned.reset();
-    expect_available(2);
-
-    const CacheBlockLocation location{.lcm_block_id = 1, .slot_index = 0};
-    EXPECT_TRUE(index.Evict(pool, location).has_value());
-    EXPECT_EQ(pool.NumEmptyLcmBlocks(), 2);
-    expect_available(2);
-}
-
-TEST(CacheCoordinatorCapacityTest, ParentBecomesAvailableAfterEveryCachedChildIsUnpinned) {
-    BlockPool pool(1, {2});
-    const std::array specs{CacheGroupSpec{
-        .kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 2, .block_granularity = 4}};
-    CacheCoordinator coordinator = MakeCoordinator(specs, /*prefix_granularity=*/4, pool);
-    PrefixCacheIndex& index = coordinator.GroupPrefixIndex(0);
-    const CacheKey first_key = Key("first", /*group_id=*/0);
-    const CacheKey second_key = Key("second", /*group_id=*/0);
-    std::vector<CacheBlockRef> refs = pool.AcquireBlocks(/*group_id=*/0, /*num=*/2);
-    ASSERT_EQ(refs.size(), 2u);
-
-    index.Register(pool, refs[0], first_key, /*access_epoch=*/1, /*logical_block_index=*/0, CacheBoundaryKind::kChunk,
-                   /*newly_cached=*/nullptr);
-    index.Register(pool, refs[1], second_key, /*access_epoch=*/1, /*logical_block_index=*/1, CacheBoundaryKind::kChunk,
-                   /*newly_cached=*/nullptr);
-    refs[0].reset();
-    EXPECT_EQ(coordinator.NumAvailableLcmBlocks(), 0);
-    refs[1].reset();
-    EXPECT_EQ(coordinator.NumAvailableLcmBlocks(), 1);
-    EXPECT_EQ(coordinator.NumAvailableLcmBlocks(), ScanAvailableLcmBlocks(index, pool, 2));
+    EXPECT_TRUE(index.Evict(pool, CacheBlockLocation{.lcm_block_id = 1, .slot_index = 0}).has_value());
+    EXPECT_EQ(coordinator.NumEmptyLcmBlocks(), 2);
+    EXPECT_EQ(coordinator.NumAvailableLcmBlocks(), 2);
 }
 
 TEST(CacheCoordinatorCapacityTest, GroupAvailablePagesTracksLocalSlotsAndEmptyParents) {

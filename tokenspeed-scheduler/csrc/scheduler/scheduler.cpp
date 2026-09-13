@@ -396,11 +396,7 @@ std::size_t Scheduler::PrefillSize() const {
     }));
 }
 
-std::size_t Scheduler::AvailableKvPages() const {
-    return static_cast<std::size_t>(coordinator_.NumAvailableLcmBlocks());
-}
-
-std::size_t Scheduler::ActiveKvPages() const {
+std::int32_t Scheduler::ActiveLcmBlocks() const {
     std::vector<std::span<const BlockTable>> request_tables;
     request_tables.reserve(requests_.size());
     for (const auto& request : requests_) {

@@ -28,10 +28,6 @@ namespace tokenspeed {
 
 class BlockPool;
 class CacheBlockRef;
-class PrefixCacheIndex;
-namespace internal_cache_block_ref {
-class CacheBlockControl;
-}
 
 // Stable logical placement of one cache block inside an LCM-sized physical
 // block. LCM block 0 remains reserved as the kernel null page.
@@ -61,10 +57,6 @@ public:
     bool IsOwnedBy(const BlockPool& pool) const noexcept { return pool_ == &pool; }
 
 private:
-    friend class internal_cache_block_ref::CacheBlockControl;
-
-    void SetReclaimable(bool reclaimable) noexcept;
-
     BlockPool* pool_{nullptr};
     CacheBlockLocation location_{};
 };
@@ -88,9 +80,7 @@ private:
 
     void retain() noexcept;
     void release() noexcept;
-    void setCacheOwned(bool cache_owned) noexcept;
     std::uint32_t useCount() const noexcept { return strong_count_; }
-    bool isReclaimable() const noexcept { return cache_owned_ && strong_count_ == 1; }
 
     CacheBlock& object() noexcept { return object_; }
     const CacheBlock& object() const noexcept { return object_; }
@@ -98,7 +88,6 @@ private:
 
     CacheBlock object_;
     std::uint32_t strong_count_{1};
-    bool cache_owned_{false};
 };
 
 }  // namespace internal_cache_block_ref
@@ -127,10 +116,8 @@ public:
 
 private:
     friend class BlockPool;
-    friend class PrefixCacheIndex;
 
     explicit CacheBlockRef(internal_cache_block_ref::CacheBlockControl& control) noexcept : control_{&control} {}
-    void setCacheOwned(bool cache_owned) noexcept;
 
     internal_cache_block_ref::CacheBlockControl* control_{nullptr};
 };

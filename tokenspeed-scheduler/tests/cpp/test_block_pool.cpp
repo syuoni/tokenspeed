@@ -42,8 +42,17 @@ TEST(BlockPoolTest, ConstructsExactlyRequestedLcmBlocks) {
     BlockPool pool(8, {4});
     EXPECT_EQ(pool.NumLcmBlocks(), 8);
     EXPECT_EQ(pool.NumEmptyLcmBlocks(), 8);
-    EXPECT_EQ(pool.NumAvailableLcmBlocks(), 8);
     EXPECT_EQ(pool.NumFreeSlots(/*group_id=*/0), 0);
+}
+
+TEST(BlockPoolTest, GroupWithoutPlacementReportsFatalInvariant) {
+    EXPECT_DEATH(
+        {
+            spdlog::set_default_logger(spdlog::stderr_color_mt("fatal-check-test"));
+            BlockPool pool(1, {1});
+            (void)pool.AcquireBlock(/*group_id=*/1);
+        },
+        "group id has no placement in this pool");
 }
 
 TEST(BlockPoolTest, MaintainsFreeSlotsAcrossOccupancyTransitions) {

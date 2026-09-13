@@ -333,7 +333,15 @@ CacheCoordinator::AcquiredPrefix CacheCoordinator::acquirePrefix(PrefixProbe&& p
 }
 
 std::int32_t CacheCoordinator::NumAvailableLcmBlocks() const {
-    return pool_.NumAvailableLcmBlocks();
+    std::int32_t available = 0;
+    for (std::int32_t parent_id = 1; parent_id <= pool_.NumLcmBlocks(); ++parent_id) {
+        const std::optional<std::uint32_t> group_id = pool_.BoundGroup(parent_id);
+        if (!group_id || groups_[*group_id].Index().ParentIsFullyEvictable(
+                             pool_, parent_id, groups_[*group_id].Allocator().CacheBlocksPerLcmBlock())) {
+            ++available;
+        }
+    }
+    return available;
 }
 
 std::int64_t CacheCoordinator::LcmBlocksNeededFor(std::span<const std::int64_t> group_pages) const {
@@ -347,18 +355,27 @@ std::int64_t CacheCoordinator::LcmBlocksNeededFor(std::span<const std::int64_t> 
     return prefix_blocks;
 }
 
-std::size_t CacheCoordinator::NumActiveLcmBlocks(std::span<const std::span<const BlockTable>> request_tables) const {
-    std::unordered_set<std::int32_t> active;
+std::int32_t CacheCoordinator::NumActiveLcmBlocks(std::span<const std::span<const BlockTable>> request_tables) const {
+    // Parent ids are dense in [1, NumLcmBlocks], so a bitmap dedupes shared
+    // prefixes without hashing every block reference of every live request.
+    std::vector<bool> seen(static_cast<std::size_t>(pool_.NumLcmBlocks()) + 1, false);
+    std::int32_t active = 0;
     for (std::span<const BlockTable> tables : request_tables) {
         for (const BlockTable& table : tables) {
             for (const CacheBlockRef& block_ref : table.Blocks()) {
-                if (block_ref) {
-                    active.insert(block_ref->Location().lcm_block_id);
+                if (!block_ref) {
+                    continue;
+                }
+                std::vector<bool>::reference parent_seen =
+                    seen[static_cast<std::size_t>(block_ref->Location().lcm_block_id)];
+                if (!parent_seen) {
+                    parent_seen = true;
+                    ++active;
                 }
             }
         }
     }
-    return active.size();
+    return active;
 }
 
 std::int32_t CacheCoordinator::GroupAvailablePages(std::int32_t group_index) const {

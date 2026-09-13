@@ -37,11 +37,12 @@
 namespace tokenspeed {
 
 // Physical LCM placement only. It deliberately has no cache key, LRU node,
-// or CacheBlock pointer.
+// CacheBlock pointer, or ownership count: the pool knows which child slots
+// are occupied, never who holds them.
 class BlockPool {
 public:
     explicit BlockPool(std::int32_t num_lcm_blocks, std::vector<std::int32_t> slots_per_group)
-        : lcm_blocks_(checkedLcmBlockCount(num_lcm_blocks)), num_available_lcm_blocks_{num_lcm_blocks} {
+        : lcm_blocks_(checkedLcmBlockCount(num_lcm_blocks)) {
         group_placements_.reserve(slots_per_group.size());
         for (std::int32_t slots_per_parent : slots_per_group) {
             _assert(slots_per_parent > 0, "slots_per_parent must be > 0");
@@ -62,8 +63,8 @@ public:
     // Number of physical LCM blocks. Kernel page 0 is reserved separately.
     std::int32_t NumLcmBlocks() const noexcept { return static_cast<std::int32_t>(lcm_blocks_.size()); }
     std::int32_t NumEmptyLcmBlocks() const noexcept { return static_cast<std::int32_t>(free_parent_ids_.size()); }
-    std::int32_t NumAvailableLcmBlocks() const noexcept { return num_available_lcm_blocks_; }
-    std::int32_t NumFreeSlots(std::uint32_t group_id) const { return group_placements_[group_id].FreeSlots(); }
+    // Unoccupied child slots inside parents already bound to group_id.
+    std::int32_t NumFreeSlots(std::uint32_t group_id) const noexcept { return placement(group_id).FreeSlots(); }
 
     CacheBlockRef AcquireBlock(std::uint32_t group_id) {
         std::vector<CacheBlockRef> blocks = AcquireBlocks(group_id, 1);
@@ -108,12 +109,12 @@ public:
         std::vector<std::deque<CacheBlockLocation>> available_locations(group_placements_.size());
         std::vector<bool> initialized_groups(group_placements_.size(), false);
         for (std::uint32_t group_id : group_ids) {
-            const GroupPlacement& placement = group_placements_[group_id];
+            const GroupPlacement& group_placement = placement(group_id);
             if (initialized_groups[group_id]) {
                 continue;
             }
             initialized_groups[group_id] = true;
-            for (const auto& [negative_occupancy, parent_id] : placement.PartialParents()) {
+            for (const auto& [negative_occupancy, parent_id] : group_placement.PartialParents()) {
                 _assert(negative_occupancy == -OccupiedCount(parent_id), "partial-parent index has stale occupancy");
                 const LcmBlock& parent = lcmBlock(parent_id);
                 for (std::size_t slot = 0; slot < parent.occupancy.size(); ++slot) {
@@ -130,7 +131,7 @@ public:
         std::vector<CacheBlockRef> out(group_ids.size());
         for (std::size_t i = 0; i < group_ids.size(); ++i) {
             const std::uint32_t group_id = group_ids[i];
-            const std::int32_t slots_per_parent = group_placements_[group_id].SlotsPerParent();
+            const std::int32_t slots_per_parent = placement(group_id).SlotsPerParent();
             std::deque<CacheBlockLocation>& available = available_locations[group_id];
             if (available.empty()) {
                 if (free_parent_ids_.empty()) {
@@ -152,7 +153,7 @@ public:
 
     std::vector<CacheBlockRef> AcquireUpToBlocksFromEmptyParent(std::uint32_t group_id, std::int32_t lcm_block_id,
                                                                 std::int32_t max_num) {
-        const std::int32_t slots_per_parent = group_placements_[group_id].SlotsPerParent();
+        const std::int32_t slots_per_parent = placement(group_id).SlotsPerParent();
         if (max_num <= 0) {
             return {};
         }
@@ -210,22 +211,14 @@ public:
                    "CacheBlock location has invalid slot");
         const std::size_t slot = static_cast<std::size_t>(location.slot_index);
         FatalCheck(parent.occupancy[slot] && parent.occupied_count > 0, "CacheBlock location is not occupied");
-        FatalCheck(!parent.reclaimable[slot], "cache-owned block released without dropping cache ownership");
         FatalCheck(parent.bound_group.has_value(), "occupied LCM parent has no group binding");
-        GroupPlacement& placement = group_placements_[*parent.bound_group];
         const std::uint32_t old_occupied_count = parent.occupied_count;
         parent.occupancy[slot] = false;
-        FatalCheck(parent.non_reclaimable_count > 0, "released block is missing its non-reclaimable count");
-        --parent.non_reclaimable_count;
-        if (parent.non_reclaimable_count == 0) {
-            ++num_available_lcm_blocks_;
-        }
         --parent.occupied_count;
-        placement.ReleaseSlot(location.lcm_block_id, old_occupied_count);
+        placement(*parent.bound_group).ReleaseSlot(location.lcm_block_id, old_occupied_count);
         if (parent.occupied_count == 0) {
             parent.bound_group.reset();
             parent.occupancy.clear();
-            parent.reclaimable.clear();
             FatalCheck(free_parent_ids_.size() < lcm_blocks_.size(),
                        "free LCM block queue cannot exceed the pool size");
             free_parent_ids_.push_back(location.lcm_block_id);
@@ -236,9 +229,7 @@ private:
     struct LcmBlock {
         std::optional<std::uint32_t> bound_group;
         std::vector<bool> occupancy;
-        std::vector<bool> reclaimable;
         std::uint32_t occupied_count{0};
-        std::uint32_t non_reclaimable_count{0};
     };
 
     class GroupPlacement {
@@ -315,6 +306,15 @@ private:
         return lcm_blocks_[static_cast<std::size_t>(lcm_block_id - 1)];
     }
 
+    const GroupPlacement& placement(std::uint32_t group_id) const noexcept {
+        FatalCheck(group_id < group_placements_.size(), "group id has no placement in this pool");
+        return group_placements_[group_id];
+    }
+    GroupPlacement& placement(std::uint32_t group_id) noexcept {
+        FatalCheck(group_id < group_placements_.size(), "group id has no placement in this pool");
+        return group_placements_[group_id];
+    }
+
     CacheBlockRef createBlockRef(std::uint32_t group_id, CacheBlockLocation location) {
         auto* control = new internal_cache_block_ref::CacheBlockControl(*this, location);
         // Allocate the control before mutating the pool, then commit the
@@ -326,15 +326,14 @@ private:
 
     void occupy(std::uint32_t group_id, CacheBlockLocation location) noexcept {
         LcmBlock& parent = lcm_blocks_[static_cast<std::size_t>(location.lcm_block_id - 1)];
-        GroupPlacement& placement = group_placements_[group_id];
-        const std::int32_t slots_per_parent = placement.SlotsPerParent();
+        GroupPlacement& group_placement = placement(group_id);
+        const std::int32_t slots_per_parent = group_placement.SlotsPerParent();
         const std::uint32_t old_occupied_count = parent.occupied_count;
         if (parent.occupied_count == 0) {
             FatalCheck(!free_parent_ids_.empty() && free_parent_ids_.front() == location.lcm_block_id,
                        "empty LCM placement must consume the next free parent");
             FatalCheck(parent.occupancy.empty(), "empty LCM parent must not retain child slots");
             parent.occupancy.assign(static_cast<std::size_t>(slots_per_parent), false);
-            parent.reclaimable.assign(static_cast<std::size_t>(slots_per_parent), false);
             free_parent_ids_.pop_front();
             parent.bound_group = group_id;
         }
@@ -345,19 +344,13 @@ private:
         FatalCheck(slot < parent.occupancy.size(), "LCM child slot is out of range");
         FatalCheck(!parent.occupancy[slot], "LCM child slot already occupied");
         parent.occupancy[slot] = true;
-        parent.reclaimable[slot] = false;
-        if (parent.non_reclaimable_count == 0) {
-            FatalCheck(num_available_lcm_blocks_ > 0, "available LCM block count underflow");
-            --num_available_lcm_blocks_;
-        }
-        ++parent.non_reclaimable_count;
         ++parent.occupied_count;
-        placement.OccupySlot(location.lcm_block_id, old_occupied_count);
+        group_placement.OccupySlot(location.lcm_block_id, old_occupied_count);
     }
 
     std::vector<CacheBlockLocation> planLocations(std::uint32_t group_id, std::size_t count) const {
-        const GroupPlacement& placement = group_placements_[group_id];
-        const std::int32_t slots_per_parent = placement.SlotsPerParent();
+        const GroupPlacement& group_placement = placement(group_id);
+        const std::int32_t slots_per_parent = group_placement.SlotsPerParent();
         if (slots_per_parent == 1) {
             std::vector<CacheBlockLocation> locations;
             const std::size_t take = std::min(count, free_parent_ids_.size());
@@ -370,7 +363,7 @@ private:
 
         std::vector<CacheBlockLocation> locations;
         locations.reserve(count);
-        for (const auto& [negative_occupancy, lcm_block_id] : placement.PartialParents()) {
+        for (const auto& [negative_occupancy, lcm_block_id] : group_placement.PartialParents()) {
             _assert(negative_occupancy == -OccupiedCount(lcm_block_id), "partial-parent index has stale occupancy");
             const LcmBlock& parent = lcmBlock(lcm_block_id);
             for (std::size_t slot = 0; slot < parent.occupancy.size() && locations.size() < count; ++slot) {
@@ -401,33 +394,6 @@ private:
         return locations;
     }
 
-    void SetReclaimable(CacheBlockLocation location, bool reclaimable) noexcept {
-        FatalCheck(location.lcm_block_id > 0 && static_cast<std::size_t>(location.lcm_block_id) <= lcm_blocks_.size(),
-                   "CacheBlock location has invalid LCM block id");
-        LcmBlock& parent = lcm_blocks_[static_cast<std::size_t>(location.lcm_block_id - 1)];
-        FatalCheck(location.slot_index >= 0 && static_cast<std::size_t>(location.slot_index) < parent.occupancy.size(),
-                   "CacheBlock location has invalid slot");
-        const std::size_t slot = static_cast<std::size_t>(location.slot_index);
-        FatalCheck(parent.occupancy[slot], "CacheBlock location is not occupied");
-        if (parent.reclaimable[slot] == reclaimable) {
-            return;
-        }
-        parent.reclaimable[slot] = reclaimable;
-        if (reclaimable) {
-            FatalCheck(parent.non_reclaimable_count > 0, "reclaimable child count underflow");
-            --parent.non_reclaimable_count;
-            if (parent.non_reclaimable_count == 0) {
-                ++num_available_lcm_blocks_;
-            }
-        } else {
-            if (parent.non_reclaimable_count == 0) {
-                FatalCheck(num_available_lcm_blocks_ > 0, "available LCM block count underflow");
-                --num_available_lcm_blocks_;
-            }
-            ++parent.non_reclaimable_count;
-        }
-    }
-
     std::vector<LcmBlock> lcm_blocks_;
     // Free parents are interchangeable: release appends and allocation consumes
     // the front. Bound parents are selected separately by planLocations().
@@ -435,9 +401,6 @@ private:
     // C++ group ids are dense scheduler indices. Their immutable packing is
     // configured with the pool before any physical parent is allocated.
     std::vector<GroupPlacement> group_placements_;
-    std::int32_t num_available_lcm_blocks_{0};
-
-    friend class CacheBlock;
 };
 
 }  // namespace tokenspeed

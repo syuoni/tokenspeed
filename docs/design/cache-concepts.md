@@ -96,18 +96,23 @@ free-slot count, bound-parent count and partial-parent index together on every
 occupancy transition. A parent with zero occupants is unbound, so its capacity
 belongs to the global empty-parent FIFO rather than any group.
 
-The pool distinguishes an **empty** parent (no children) from an **available**
-parent (empty, or every child is reclaimable). A child is reclaimable exactly
-when a prefix-cache entry owns its sole reference (`cache_owned &&
-strong_count == 1`). `CacheBlockRef` reports transitions across that boundary
-to the pool. Cache keys and eviction policy remain in `PrefixCacheIndex`; the
-pool sees only placement and reclaimability.
+The pool knows which child slots are occupied, never who holds them. Whether a
+child is pinned by a request table, published by a prefix-cache entry, or held
+by an in-flight transfer is a `CacheBlockRef` ownership fact that lives with
+the holders; the pool does not track it, and `CacheBlockRef` does not report
+it. Anything that needs "held only by the cache" asks `PrefixCacheIndex`
+(`ParentIsFullyEvictable`), which is a scan and is therefore reserved for
+eviction policy and leak checks, not for per-step accounting.
 
 Admission first checks the indexed free-slot and empty-parent counts. If the
 request fits, it does not enumerate eviction candidates. Under memory pressure,
 it enumerates candidates and keeps shadow occupancy only for the parents whose
 children it tentatively evicts. This makes the common zero-eviction path scale
 with cache groups and request demand rather than total cache capacity.
+
+The per-step page gauge composes two O(1)-or-cheaper quantities the same way:
+empty parents come from the pool, active parents from the live requests' block
+tables, and cache-only residency is the remainder `total - empty - active`.
 
 ## Who is allowed to see what
 
