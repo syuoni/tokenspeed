@@ -64,6 +64,7 @@ from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
 )
+from tokenspeed.runtime.execution.forward_step import prefill_graph_phase
 from tokenspeed.runtime.layers.attention.backends.cache_metadata import (
     CacheBatchMetadata,
 )
@@ -345,7 +346,11 @@ class PrefillGraph:
             max_bs=int(self.config.max_num_seqs)
             // max(int(self.config.data_parallel_size), 1),
         )
-        with maybe_inference_mode():
+        # Publish a prefill-specific phase during both warmup and capture.  Do
+        # not reuse the full-graph flags: BreakableCapture ends each segment
+        # around eager attention, so a model-wide auxiliary stream cannot span
+        # that break.  The captured branch is replayed directly afterward.
+        with maybe_inference_mode(), prefill_graph_phase():
             self._capture_all_buckets(decode_wrapper)
 
     def _capture_all_buckets(self, decode_wrapper: ForwardStepRunner | None) -> None:
