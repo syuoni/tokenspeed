@@ -3380,8 +3380,8 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
 
         ffn_input_ids = input_ids
-        use_mega_moe = getattr(self.ffn, "use_mega_moe", False)
-        owns_ep_communication = getattr(self.ffn, "owns_ep_communication", False)
+        use_mega_moe = self.ffn.use_mega_moe
+        owns_ep_communication = self.ffn.owns_ep_communication
         if owns_ep_communication:
             token_counts = self.comm_manager.moe_tp_ep_group_scattered_num_tokens(ctx)
             num_global_tokens = sum(token_counts)
